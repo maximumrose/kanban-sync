@@ -1,20 +1,21 @@
-# Sticky-note detection -> Trello sync with identity + grace archiving
-# - 3 columns as calibrated
-# - Create only after stable+still AND uniqueness check passes
-# - Move when a known sticky changes columns (stable+still)
-# - Recover from "missing" (no new card)
-# - Archive only after 60 seconds missing
-# - OCR titles + auto-rename window retained
+# Simpler scan-based sticky -> Trello sync (no motion prediction)
+# - Board is scanned at fixed intervals (default 300ms)
+# - Identity via appearance: HSV histogram + perceptual aHash
+# - NEW stickies promoted only after a few consistent scans (debounce)
+# - MOVE when the same sticky is stably seen in a new column
+# - ARCHIVE only after 60s missing (time-based)
+# - Optional OCR for initial title + post-create rename attempts
 
-import json, time, sys, math, difflib
+import json, sys, time, math
 from pathlib import Path
 import numpy as np
 import cv2
+import difflib
 
 from trello_api import create_card, move_card, archive_card, rename_card
 from ocr_utils import ocr_text
 
-# ---------- Load config ----------
+# ---------------- Config load ----------------
 ROOT = Path(__file__).resolve().parents[1]
 cfg_path = ROOT / "config" / "board_layout.json"
 map_path = ROOT / "config" / "trello_mapping.json"
@@ -35,9 +36,9 @@ M = np.array(CFG["warp"]["M"], dtype=np.float32)
 W, H = int(CFG["warp"]["W"]), int(CFG["warp"]["H"])
 COLUMNS = CFG["columns"]
 COL_TO_LIST = MAP["column_to_list"]
-COL_NAMES = [c["name"] for c in COLUMNS]
-missing = [n for n in COL_NAMES if n not in COL_TO_LIST]
-if missing: die(f"mapping missing columns: {missing}. Re-run map_columns_to_trello.py")
+for c in COLUMNS:
+    if c["name"] not in COL_TO_LIST:
+        die(f"List mapping missing for column '{c['name']}'. Run map_columns_to_trello.py")
 
 def col_for_x(x):
     for c in COLUMNS:
@@ -45,8 +46,7 @@ def col_for_x(x):
             return c["name"]
     return None
 
-# ---------- Detection params ----------
-# HSV ranges (H:0..179, S/V:0..255)
+# ---------------- Detection params ----------------
 COLOR_RANGES = [
     ((15,  80, 100), (35, 255, 255)),  # yellow
     ((5,   80, 100), (15, 255, 255)),  # orange
@@ -58,26 +58,33 @@ COLOR_RANGES = [
 MIN_AREA_RATIO, MAX_AREA_RATIO = 0.001, 0.20
 ASPECT_MIN, ASPECT_MAX = 0.6, 1.8
 
-# ---------- Tracker / Association thresholds ----------
-ASSIGN_DIST_MAX    = 180.0  # px (distance gate after prediction)
-HIST_INTERSECT_MIN = 0.30   # appearance gate 0..1 for matching
-ALPHA_SIZE         = 0.2    # EMA for size smoothing
-ALPHA_HIST         = 0.3    # EMA for histogram update
+# Throttle & debounce (power-friendly)
+SCAN_INTERVAL_MS     = 300   # scan every 0.3s (adjust 200-400ms to taste)
+CREATE_SEEN_SCANS    = 2     # scans required before creating Trello card
+MOVE_STABLE_SCANS    = 2     # scans in same new column before moving
+CANDIDATE_FORGET_SEC = 10.0  # drop candidate if not seen within this window
+MISSING_TTL_SEC      = 60.0  # archive only after 60s missing
 
-# ---------- Event gating ----------
-STABLE_FRAMES = 6           # same column N frames
-STILL_FRAMES  = 8           # low motion N frames
-SPEED_PX      = 2.0         # px/frame considered still
-BIRTH_DELAY   = 12          # frames before a candidate may "create"
-MISSING_TTL_SEC = 60.0      # archive only after this many seconds missing
+# Appearance similarity thresholds
+HIST_BINS_H, HIST_BINS_S = 24, 24
+HIST_INTERSECT_MIN   = 0.22      # gate for considering a match (0..1)
+AHASH_MIN_SIM        = 0.60      # 1 - Hamming/64
+SIM_WEIGHT_HIST      = 0.65
+SIM_WEIGHT_AHASH     = 0.35
+RECOVER_SIM_THRESH   = 0.55      # to match MISSING (reacquire)
+ACTIVE_SIM_THRESH    = 0.80      # to match ACTIVE (same sticky)
+CAND_SIM_THRESH      = 0.70      # to persist a candidate across scans
 
-# ---------- OCR / rename ----------
-OCR_EVERY_N       = 3
-OCR_RENAME_WINDOW = 30
-RENAME_MIN_CONF   = 60.0
-IMPROVE_DELTA     = 8.0
+# OCR/rename cadence
+OCR_FOR_CREATE       = True      # run a quick OCR when creating card
+OCR_RENAME_EVERY_N   = 3         # rename attempt every N scans
+RENAME_MIN_CONF      = 60.0
+IMPROVE_DELTA        = 8.0
+RENAME_WINDOW_SCANS  = 30
 
-# ---------- Helpers ----------
+ALPHA_HIST           = 0.3       # EMA update for hist when matched
+
+# ---------------- Helpers ----------------
 def detect_notes(img_bgr):
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -101,373 +108,300 @@ def detect_notes(img_bgr):
         out.append((x,y,w,h,cx,cy))
     return out, mask
 
-def hs_hist(img_bgr, box):
+def clamp_box(box):
     x,y,w,h = box
-    x = max(0, x); y = max(0, y)
-    w = max(1, min(w, img_bgr.shape[1]-x))
-    h = max(1, min(h, img_bgr.shape[0]-y))
-    roi = img_bgr[y:y+h, x:x+w]
+    x = int(max(0, min(x, W-1))); y = int(max(0, min(y, H-1)))
+    w = int(max(1, min(w, W-x)));  h = int(max(1, min(h, H-y)))
+    return (x,y,w,h)
+
+def roi_from_box(img, box, m=6):
+    x,y,w,h = box
+    return img[max(0,y-m):min(H,y+h+m), max(0,x-m):min(W,x+w+m)]
+
+def hs_hist(img_bgr, box):
+    roi = roi_from_box(img_bgr, box, m=0)
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv],[0,1],None,[30,32],[0,180,0,256])
+    hist = cv2.calcHist([hsv],[0,1],None,[HIST_BINS_H,HIST_BINS_S],[0,180,0,256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
+    return hist.astype(np.float32)
+
+def ahash64(img_bgr, box):
+    roi = cv2.cvtColor(roi_from_box(img_bgr, box), cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(roi, (8,8), interpolation=cv2.INTER_AREA)
+    avg = float(small.mean())
+    bits = (small > avg).flatten()
+    val = 0
+    for b in bits:
+        val = (val << 1) | int(bool(b))
+    return val  # 64-bit int
+
+def ahash_sim(a, b):
+    # similarity in [0,1]; 1 is identical
+    hd = bin((a ^ b) & ((1<<64)-1)).count("1")
+    return 1.0 - hd/64.0
 
 def hist_intersection(h1, h2):
     if h1 is None or h2 is None: return 0.0
-    return float(cv2.compareHist(h1, h2, cv2.HISTCMP_INTERSECT))  # 0..1 with norm
+    return float(cv2.compareHist(h1, h2, cv2.HISTCMP_INTERSECT))
 
-def clamp_box(box):
-    x,y,w,h = box
-    x = int(max(0, min(x, W-1)))
-    y = int(max(0, min(y, H-1)))
-    w = int(max(1, min(w, W-x)))
-    h = int(max(1, min(h, H-y)))
-    return (x,y,w,h)
-
-def box_center(box):
-    x,y,w,h = box
-    return (x + w/2.0, y + h/2.0)
-
-def diag_len(box):
-    return math.hypot(box[2], box[3])
-
-def spatial_affinity(dist, ref_diag, scale=1.5):
-    # map distance to [0..1]: 1 at 0 distance, 0 at >= scale*diag
-    thr = max(1.0, scale * max(8.0, ref_diag))
-    s = max(0.0, 1.0 - float(dist)/thr)
-    return s
-
-def text_similarity(a, b):
+def text_sim(a, b):
     if not a or not b: return 0.0
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-# ---------- Track model (with FSM state) ----------
-class Track:
-    # state ∈ {"CANDIDATE","ACTIVE","MISSING"}
-    def __init__(self, tid, box, img_for_hist):
-        self.id   = tid
-        self.box  = clamp_box(box)
-        cx, cy    = box_center(self.box)
+def sim_score(hsim, hashsim):
+    return SIM_WEIGHT_HIST*hsim + SIM_WEIGHT_AHASH*hashsim
 
-        # Kalman (x,y,vx,vy) -> (x,y)
-        self.kf = cv2.KalmanFilter(4,2)
-        dt = 1.0
-        self.kf.transitionMatrix = np.array([[1,0,dt,0],
-                                             [0,1,0,dt],
-                                             [0,0,1,0],
-                                             [0,0,0,1]], np.float32)
-        self.kf.measurementMatrix = np.array([[1,0,0,0],
-                                              [0,1,0,0]], np.float32)
-        self.kf.processNoiseCov = np.array([[1,0,0,0],
-                                            [0,1,0,0],
-                                            [0,0,5,0],
-                                            [0,0,0,5]], np.float32) * 0.03
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.6
-        self.kf.statePost = np.array([[cx],[cy],[0],[0]], np.float32)
-        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+def center_x(box):
+    return box[0] + box[2]/2.0
+
+def column_for_box(box):
+    return col_for_x(center_x(box))
+
+# ---------------- Registry ----------------
+class Entry:
+    # state ∈ {"CANDIDATE","ACTIVE","MISSING"}
+    def __init__(self, sid, box, hist, ahash, now_ts):
+        self.id = sid
+        self.box = clamp_box(box)
+        self.hist = hist
+        self.ahash = ahash
 
         self.state = "CANDIDATE"
-        self.birth_frames = 0
-        self.stable = 0
-        self.still = 0
-        self.measured_col = None
-        self.prev_pos = (cx, cy)
+        self.seen_scans = 1
+        self.last_seen = now_ts
+        self.cand_last_seen = now_ts
+        self.missing_since = None
 
-        self.hist = hs_hist(img_for_hist, self.box)
-        self.best_text = ""
-        self.best_conf = 0.0
-
-        self.card_id = None
-        self.card_name = None
+        self.measured_col = column_for_box(self.box)
+        self.col_stable_scans = 1
         self.committed_col = None
 
-        now = time.monotonic()
-        self.last_seen = now
-        self.missing_since = None
-        self.ocr_attempts = 0
+        # Trello
+        self.card_id = None
+        self.card_name = None
 
-    def predict(self):
-        p = self.kf.predict()
-        cx, cy = float(p[0]), float(p[1])
-        x = int(cx - self.box[2]/2)
-        y = int(cy - self.box[3]/2)
-        self.box = clamp_box((x,y,self.box[2],self.box[3]))
-        return cx, cy
+        # OCR cache
+        self.best_text = ""
+        self.best_conf = 0.0
+        self.rename_attempts = 0
 
-    def correct(self, det_box, img_for_hist):
-        x,y,w,h = det_box
-        cx, cy = x + w/2.0, y + h/2.0
-        self.kf.correct(np.array([[np.float32(cx)], [np.float32(cy)]]))
-        # smooth size
-        bx,by,bw,bh = self.box
-        bw = int((1-ALPHA_SIZE)*bw + ALPHA_SIZE*w)
-        bh = int((1-ALPHA_SIZE)*bh + ALPHA_SIZE*h)
-        self.box = clamp_box((int(cx - bw/2), int(cy - bh/2), bw, bh))
-        # update appearance
-        new_hist = hs_hist(img_for_hist, (int(x),int(y),int(w),int(h)))
-        if new_hist is not None:
-            if self.hist is None:
-                self.hist = new_hist
-            else:
-                self.hist = (1-ALPHA_HIST)*self.hist + ALPHA_HIST*new_hist
-        # seen now
-        self.last_seen = time.monotonic()
-        self.missing_since = None
+    def update_seen(self, box, hist, ahash, now_ts):
+        self.box = clamp_box(box)
+        # EMA hist
+        if self.hist is None: self.hist = hist
+        else: self.hist = (1-ALPHA_HIST)*self.hist + ALPHA_HIST*hist
+        self.ahash = ahash
+        self.last_seen = now_ts
+        if self.state == "CANDIDATE":
+            self.cand_last_seen = now_ts
+            self.seen_scans += 1
 
-# ---------- Registry ----------
-tracks = {}      # tid -> Track
+        # Column stability
+        col = column_for_box(self.box)
+        if col == self.measured_col:
+            self.col_stable_scans += 1
+        else:
+            self.measured_col = col
+            self.col_stable_scans = 1
+
+# Entries by id
+entries = {}
+global next_id
 next_id = 1
 
-# ---------- Matching / Uniqueness ----------
-def associate_existing(detections, frame_img):
-    """Primary association for already-known tracks (ACTIVE or CANDIDATE).
-       Returns: assigned map {tid: det_index}, sets of unassigned tracks and dets."""
-    # Predict all tracks
-    for tr in tracks.values():
-        tr.predict()
-
-    # Candidate pairs with cost using distance + hist
-    cand = []
-    det_boxes = [(int(x),int(y),int(w),int(h)) for (x,y,w,h,_,_) in detections]
-    det_centers = [(cx,cy) for (*_,cx,cy) in detections]
-
-    tids = list(tracks.keys())
-    for tid in tids:
-        tr = tracks[tid]
-        if tr.state not in ("ACTIVE","CANDIDATE"):
+def best_match(hist, ah, pool_ids):
+    """Return (entry_id, score, hsim, hashsim) or (None, 0, 0, 0)."""
+    best_id, best_score, best_h, best_a = None, 0.0, 0.0, 0.0
+    for eid in pool_ids:
+        e = entries[eid]
+        hsim = hist_intersection(hist, e.hist)
+        if hsim < HIST_INTERSECT_MIN: 
             continue
-        tcx, tcy = box_center(tr.box)
-        ref_diag = diag_len(tr.box)
-        for j, (dbox, (cx,cy)) in enumerate(zip(det_boxes, det_centers)):
-            dist = math.hypot(cx - tcx, cy - tcy)
-            if dist > ASSIGN_DIST_MAX:  # distance gate
-                continue
-            hsim = hist_intersection(tr.hist, hs_hist(frame_img, dbox))
-            if hsim < HIST_INTERSECT_MIN:  # appearance gate
-                continue
-            # cost: lower is better
-            dist_norm = dist / max(8.0, ref_diag)
-            cost = 0.7*dist_norm + 0.3*(1.0 - hsim)
-            cand.append((cost, tid, j, dbox))
-
-    cand.sort(key=lambda x: x[0])
-    assigned_tr, assigned_det = set(), set()
-    assigned = {}
-    for cost, tid, j, dbox in cand:
-        if tid in assigned_tr or j in assigned_det:
+        asim = ahash_sim(ah, e.ahash)
+        if asim < AHASH_MIN_SIM:
             continue
-        tracks[tid].correct(dbox, frame_img)
-        assigned[tid] = j
-        assigned_tr.add(tid); assigned_det.add(j)
+        s = sim_score(hsim, asim)
+        if s > best_score:
+            best_id, best_score, best_h, best_a = eid, s, hsim, asim
+    return best_id, best_score, best_h, best_a
 
-    # Unassigned sets
-    unassigned_tracks = {tid for tid in tracks.keys() if tid not in assigned and tracks[tid].state in ("ACTIVE","CANDIDATE")}
-    unassigned_dets = {j for j in range(len(detections)) if j not in assigned_det}
-    return assigned, unassigned_tracks, unassigned_dets
-
-def uniqueness_check_for_new_det(j, detections, frame_img):
-    """Try to bind unmatched detection j to MISSING first (recover), then ACTIVE duplicate guard."""
-    x,y,w,h,cx,cy = detections[j]
-    dbox = (int(x),int(y),int(w),int(h))
-    dcenter = (cx, cy)
-    dhist = hs_hist(frame_img, dbox)
-
-    # 1) try MISSING (recover)
-    best_t, best_score = None, -1.0
-    now = time.monotonic()
-    for tid, tr in tracks.items():
-        if tr.state != "MISSING":
-            continue
-        # prefer recent miss
-        if tr.missing_since is None or now - tr.missing_since > MISSING_TTL_SEC:
-            continue
-        tcx, tcy = box_center(tr.box)  # predicted position already applied
-        dist = math.hypot(dcenter[0]-tcx, dcenter[1]-tcy)
-        sp = spatial_affinity(dist, diag_len(tr.box), scale=1.5)  # 0..1
-        ap = hist_intersection(tr.hist, dhist)                    # 0..1
-        if ap < 0.25:
-            continue
-        score = 0.6*ap + 0.4*sp
-        if score > best_score:
-            best_score, best_t = score, tid
-
-    if best_t is not None and best_score >= 0.55:
-        # Recover this missing track
-        tracks[best_t].correct(dbox, frame_img)
-        tracks[best_t].state = "ACTIVE"
-        return ("RECOVER", best_t)
-
-    # 2) ACTIVE duplicate guard (reject double-detections)
-    best_t, best_score = None, -1.0
-    for tid, tr in tracks.items():
-        if tr.state != "ACTIVE":
-            continue
-        tcx, tcy = box_center(tr.box)
-        dist = math.hypot(dcenter[0]-tcx, dcenter[1]-tcy)
-        sp = spatial_affinity(dist, diag_len(tr.box), scale=0.8)
-        ap = hist_intersection(tr.hist, dhist)
-        score = 0.6*ap + 0.4*sp
-        if score > best_score:
-            best_score, best_t = score, tid
-
-    if best_t is not None and best_score >= 0.70:
-        # Treat as duplicate sighting of an ACTIVE track; ignore creation
-        return ("DUPLICATE_ACTIVE", best_t)
-
-    # 3) No match → new candidate
-    return ("NEW", None)
-
-# ---------- Main loop ----------
+# ---------------- Main loop (scan-based) ----------------
 cap = cv2.VideoCapture(0)
-if not cap.isOpened(): die("Camera not found / permission issue.")
-print("Controls: q=quit, m=toggle mask view")
-show_mask, frame_i = False, 0
+if not cap.isOpened():
+    die("Camera not found / permission issue.")
+
+# (Optional) downshift camera load a bit
+# cap.set(cv2.CAP_PROP_FPS, 15)
+# cap.set(cv2.CAP_PROP_FRAME_WIDTH,  960)
+# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+
+print("Controls: q=quit, m=toggle mask")
+show_mask = False
+scan_idx = 0
+last_scan = 0.0
 
 while True:
+    # Throttle scanning for power
+    now = time.monotonic()
+    sleep_s = max(0.0, (SCAN_INTERVAL_MS/1000.0) - (now - last_scan))
+    if sleep_s > 0: time.sleep(sleep_s)
+    last_scan = time.monotonic()
+    scan_idx += 1
+
     ok, frame = cap.read()
     if not ok: break
-    frame_i += 1
 
     warped = cv2.warpPerspective(frame, M, (W, H))
-    detections, mask = detect_notes(warped)
+    dets, mask = detect_notes(warped)
 
-    # 1) Primary association (ACTIVE/CANDIDATE)
-    assigned, un_tracks, un_dets = associate_existing(detections, warped)
+    # Precompute descriptors for all detections
+    obs = []  # list of dicts: {box,hist,ahash,col}
+    for (x,y,w,h,_,_) in dets:
+        box = (int(x),int(y),int(w),int(h))
+        hist = hs_hist(warped, box)
+        ah = ahash64(warped, box)
+        obs.append({"box": box, "hist": hist, "ahash": ah, "col": column_for_box(box)})
 
-    # 2) Mark unassigned tracks as MISSING (start timer, do not archive yet)
-    now = time.monotonic()
-    for tid in list(un_tracks):
-        tr = tracks[tid]
-        if tr.state != "MISSING":
-            tr.state = "MISSING"
-            if tr.missing_since is None:
-                tr.missing_since = now
+    # Mark all entries as unseen this scan
+    seen_ids = set()
 
-    # 3) Uniqueness check for each unassigned detection
-    for j in list(un_dets):
-        verdict, ref_tid = uniqueness_check_for_new_det(j, detections, warped)
-        if verdict == "RECOVER":
-            # Already corrected inside uniqueness; track set ACTIVE
-            pass
-        elif verdict == "DUPLICATE_ACTIVE":
-            # Ignore this detection
-            pass
-        else:
-            # NEW → create a CANDIDATE track
-            x,y,w,h,_,_ = detections[j]
-            tid = next_id; next_id += 1
-            tracks[tid] = Track(tid, (int(x),int(y),int(w),int(h)), warped)
-            # Leave as CANDIDATE; promotion after gating below
+    # Pools
+    active_ids   = [eid for eid,e in entries.items() if e.state == "ACTIVE"]
+    missing_ids  = [eid for eid,e in entries.items() if e.state == "MISSING"]
+    cand_ids     = [eid for eid,e in entries.items() if e.state == "CANDIDATE"]
 
-    # 4) Per-track FSM + Trello sync
-    for tid, tr in list(tracks.items()):
-        # Update birth frames
-        tr.birth_frames += 1
+    # Greedy matching for each observation:
+    for ob in obs:
+        box, hist, ah, col = ob["box"], ob["hist"], ob["ahash"], ob["col"]
 
-        # Column + gating counters
-        x,y,w,h = tr.box
-        cx, cy = box_center(tr.box)
-        current_col = col_for_x(cx)
+        # 1) Prefer recovering a MISSING entry
+        mid, mscore, _, _ = best_match(hist, ah, missing_ids)
+        if mid is not None and mscore >= RECOVER_SIM_THRESH and mid not in seen_ids:
+            e = entries[mid]
+            e.state = "ACTIVE"
+            e.missing_since = None
+            e.update_seen(box, hist, ah, last_scan)
+            seen_ids.add(mid)
+            continue
 
-        # Debounce on measured column
-        if tr.measured_col == current_col:
-            tr.stable += 1
-        else:
-            tr.measured_col = current_col
-            tr.stable = 1
+        # 2) Try binding to an ACTIVE entry (same sticky)
+        aid, ascore, _, _ = best_match(hist, ah, active_ids)
+        if aid is not None and ascore >= ACTIVE_SIM_THRESH and aid not in seen_ids:
+            e = entries[aid]
+            e.update_seen(box, hist, ah, last_scan)
+            seen_ids.add(aid)
+            continue
 
-        # Stillness
-        px, py = tr.prev_pos
-        speed = math.hypot(cx - px, cy - py)
-        tr.prev_pos = (cx, cy)
-        tr.still = tr.still + 1 if speed <= SPEED_PX else 0
+        # 3) Try to continue a CANDIDATE
+        cid, cscore, _, _ = best_match(hist, ah, cand_ids)
+        if cid is not None and cscore >= CAND_SIM_THRESH and cid not in seen_ids:
+            e = entries[cid]
+            e.update_seen(box, hist, ah, last_scan)
+            seen_ids.add(cid)
+            continue
 
-        # State transitions
-        if tr.state == "CANDIDATE":
-            # Promote to ACTIVE only after birth delay + stable + still
-            if tr.birth_frames >= BIRTH_DELAY and tr.stable >= STABLE_FRAMES and tr.still >= STILL_FRAMES and current_col:
-                tr.state = "ACTIVE"
-                tr.committed_col = current_col
-                # Create Trello card now
-                list_id = COL_TO_LIST.get(current_col)
+        # 4) Otherwise, start a new candidate
+        eid = next_id; next_id += 1
+        e = Entry(eid, box, hist, ah, last_scan)
+        entries[eid] = e
+        seen_ids.add(eid)
+        cand_ids.append(eid)
+
+    # Handle entries not seen this scan
+    now_ts = last_scan
+    for eid, e in list(entries.items()):
+        if eid in seen_ids:
+            continue
+        if e.state == "ACTIVE":
+            e.state = "MISSING"
+            if e.missing_since is None:
+                e.missing_since = now_ts
+        elif e.state == "CANDIDATE":
+            # forget if stale
+            if (now_ts - e.cand_last_seen) > CANDIDATE_FORGET_SEC:
+                del entries[eid]
+
+    # Promote candidates, move actives, rename, archive
+    for eid, e in list(entries.items()):
+        x,y,w,h = e.box
+        col = e.measured_col
+
+        # --- promote CANDIDATE to ACTIVE (create Trello) ---
+        if e.state == "CANDIDATE":
+            if e.seen_scans >= CREATE_SEEN_SCANS and e.col_stable_scans >= MOVE_STABLE_SCANS and col:
+                list_id = COL_TO_LIST.get(col)
                 if list_id:
-                    # try OCR title quickly (best so far)
-                    mx = max(0, x-6); my = max(0, y-6)
-                    roi = warped[my:my+h+12, mx:mx+w+12]
-                    txt, conf = ocr_text(roi)
-                    if txt and conf > tr.best_conf:
-                        tr.best_text, tr.best_conf = txt, conf
-                    title = tr.best_text if (tr.best_text and len(tr.best_text) >= 3) else f"Note {int(time.time())}"
+                    title = f"Note {int(time.time())}"
+                    if OCR_FOR_CREATE:
+                        roi = roi_from_box(warped, e.box, m=8)
+                        t, c = ocr_text(roi)
+                        if t and len(t) >= 3:
+                            e.best_text, e.best_conf = t, c
+                            title = t
                     try:
                         card = create_card(list_id, title)
-                        tr.card_id = card["id"]
-                        tr.card_name = title
-                        tr.ocr_attempts = 0
-                        print(f"[trello] create '{title}' in {current_col} -> {card.get('shortUrl','')}")
-                    except Exception as e:
-                        print("[trello] create error:", e)
+                        e.card_id = card["id"]
+                        e.card_name = title
+                        e.committed_col = col
+                        e.state = "ACTIVE"
+                        e.rename_attempts = 0
+                        print(f"[trello] create '{title}' in {col} -> {card.get('shortUrl','')}")
+                    except Exception as ex:
+                        print("[trello] create error:", ex)
 
-        elif tr.state == "ACTIVE":
-            # Move if column changed and gates satisfied
-            if current_col and tr.committed_col and current_col != tr.committed_col and tr.stable >= STABLE_FRAMES and tr.still >= STILL_FRAMES:
-                list_id = COL_TO_LIST.get(current_col)
-                if list_id and tr.card_id:
+        # --- ACTIVE: move if stable in a *new* column ---
+        if e.state == "ACTIVE" and e.card_id:
+            if e.committed_col and col and col != e.committed_col and e.col_stable_scans >= MOVE_STABLE_SCANS:
+                list_id = COL_TO_LIST.get(col)
+                if list_id:
                     try:
-                        move_card(tr.card_id, list_id)
-                        tr.committed_col = current_col
-                        print(f"[trello] move card {tr.card_id} -> {current_col}")
-                    except Exception as e:
-                        print("[trello] move error:", e)
+                        move_card(e.card_id, list_id)
+                        e.committed_col = col
+                        print(f"[trello] move card {e.card_id} -> {col}")
+                    except Exception as ex:
+                        print("[trello] move error:", ex)
 
-        elif tr.state == "MISSING":
-            # Nothing to do here; archiving handled by TTL below
-            pass
-
-        # OCR periodic + rename window
-        if tr.card_id and tr.ocr_attempts < OCR_RENAME_WINDOW and frame_i % OCR_EVERY_N == 0:
-            mx = max(0, x-6); my = max(0, y-6)
-            roi = warped[my:my+h+12, mx:mx+w+12]
-            txt, conf = ocr_text(roi)
-            if txt and conf > tr.best_conf + 0.5:
-                tr.best_text, tr.best_conf = txt, conf
-            # rename if clearly better
-            if tr.best_text and len(tr.best_text) >= 3:
-                better_conf = (tr.best_conf >= RENAME_MIN_CONF) or \
-                              ((tr.best_conf - (0.0 if (tr.card_name or '').startswith("Note ") else 50.0)) >= IMPROVE_DELTA)
-                if better_conf and tr.best_text != (tr.card_name or ""):
+        # --- Optional OCR rename for a while after creation ---
+        if e.state == "ACTIVE" and e.card_id and (scan_idx % OCR_RENAME_EVERY_N == 0) and e.rename_attempts < RENAME_WINDOW_SCANS:
+            roi = roi_from_box(warped, e.box, m=8)
+            t, c = ocr_text(roi)
+            if t and c > (e.best_conf + 0.5):
+                e.best_text, e.best_conf = t, c
+            if e.best_text and len(e.best_text) >= 3:
+                better = (e.best_conf >= RENAME_MIN_CONF) or \
+                         ((e.best_conf - (0.0 if (e.card_name or '').startswith("Note ") else 50.0)) >= IMPROVE_DELTA)
+                if better and e.best_text != (e.card_name or ""):
                     try:
-                        rename_card(tr.card_id, tr.best_text)
-                        tr.card_name = tr.best_text
-                        print(f"[trello] rename card {tr.card_id} -> '{tr.best_text}' (conf {tr.best_conf:.1f})")
+                        rename_card(e.card_id, e.best_text)
+                        e.card_name = e.best_text
+                        print(f"[trello] rename card {e.card_id} -> '{e.best_text}' (conf {e.best_conf:.1f})")
                     except Exception:
                         pass
-            tr.ocr_attempts += 1
+            e.rename_attempts += 1
 
-        # Draw overlay with state and timers
-        state_tag = tr.state
-        if tr.state == "MISSING" and tr.missing_since is not None:
-            state_tag = f"MISSING {int(time.monotonic()-tr.missing_since)}s"
-        cv2.rectangle(warped, (x,y), (x+w, y+h), (0,255,0), 2)
-        cv2.putText(warped, f"id {tid} {state_tag} -> {current_col or '?'} st:{tr.stable} still:{tr.still} spd:{speed:.1f}",
-                    (x, max(15,y-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
-
-    # 5) Time-based archiving for long-missing tracks
-    now = time.monotonic()
-    for tid in list(tracks.keys()):
-        tr = tracks[tid]
-        if tr.state == "MISSING" and tr.missing_since is not None:
-            if (now - tr.missing_since) >= MISSING_TTL_SEC:
-                if tr.card_id:
+        # --- MISSING: archive only after TTL ---
+        if e.state == "MISSING" and e.missing_since is not None:
+            if (now_ts - e.missing_since) >= MISSING_TTL_SEC:
+                if e.card_id:
                     try:
-                        archive_card(tr.card_id)
-                        print(f"[trello] archived {tr.card_id} after {MISSING_TTL_SEC:.0f}s missing (track {tid})")
-                    except Exception as e:
-                        print("[trello] archive error:", e)
-                del tracks[tid]
+                        archive_card(e.card_id)
+                        print(f"[trello] archived {e.card_id} after {int(MISSING_TTL_SEC)}s missing (id {eid})")
+                    except Exception as ex:
+                        print("[trello] archive error:", ex)
+                del entries[eid]
 
-    # 6) Windows
-    cv2.imshow("warped (notes + sync)", warped)
+    # ---- Draw overlay ----
+    vis = warped.copy()
+    for eid, e in entries.items():
+        x,y,w,h = e.box
+        state = e.state if e.state != "MISSING" else f"MISSING {int(now_ts - (e.missing_since or now_ts))}s"
+        label = f"id {eid} {state} -> {e.measured_col or '?'}"
+        cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0), 2)
+        cv2.putText(vis, label, (x, max(15,y-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
+
+    cv2.imshow("warped (simple scan + sync)", vis)
     if show_mask: cv2.imshow("mask", mask)
+
     k = cv2.waitKey(1) & 0xFF
     if k == ord('q'): break
     elif k == ord('m'):
@@ -476,4 +410,5 @@ while True:
             try: cv2.destroyWindow("mask")
             except cv2.error: pass
 
-cap.release(); cv2.destroyAllWindows()
+cap.release()
+cv2.destroyAllWindows()
