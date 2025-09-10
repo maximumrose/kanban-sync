@@ -1,0 +1,1 @@
+A project to convert a physical kanban board (sticky notes on a white board) into a digital representation in Trello. Eventually project may also include functionality to do the opposite conversion - from the Trello board to the physical board using motion control.
